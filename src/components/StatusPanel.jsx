@@ -1,14 +1,14 @@
-import { formatDistanceToNow } from 'date-fns';
-import { enUS } from 'date-fns/locale';
+const CONFIGS = {
+  0: { label: 'Clear', color: 'bg-gray-500', text: 'text-gray-500' },
+  1: { label: 'Watch', color: 'bg-amber-500', text: 'text-amber-500' },
+  2: { label: 'Warning', color: 'bg-orange-500', text: 'text-orange-500' },
+  3: { label: 'Shelter', color: 'bg-red-600', text: 'text-red-600' },
+};
 
-export default function StatusPanel({ status, lastStrike }) {
-  const configs = {
-    0: { label: 'Clear', color: 'bg-gray-500', text: 'text-gray-500' },
-    1: { label: 'Watch', color: 'bg-amber-500', text: 'text-amber-500' },
-    2: { label: 'Warning', color: 'bg-orange-500', text: 'text-orange-500' },
-    3: { label: 'Shelter', color: 'bg-red-600', text: 'text-red-600' }
-  };
-  const cfg = configs[status.currentLevel || 0];
+export default function StatusPanel({ status = {}, lastStrike }) {
+  // Fall back to level 0 for an unknown/out-of-range level rather than reading
+  // `.color` off undefined.
+  const cfg = CONFIGS[status.currentLevel] || CONFIGS[0];
 
   return (
     <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">

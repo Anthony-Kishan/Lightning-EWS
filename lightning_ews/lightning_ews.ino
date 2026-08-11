@@ -56,7 +56,7 @@ const unsigned long ALL_CLEAR_MS = 30UL * 60UL * 1000UL;   // 30 minutes
 #define PIN_SDA        21
 #define PIN_SCL        22
 #define PIN_AS3935_IRQ  4    // AS3935 IRQ -> ESP32 GPIO4
--
+
 // SIM800L on UART2
 #define PIN_SIM_RX     16    // ESP32 RX2  <- SIM800L TXD
 #define PIN_SIM_TX     17    // ESP32 TX2  -> SIM800L RXD (through divider)

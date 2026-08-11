@@ -1,8 +1,6 @@
-import { Zap, Radio, ChevronDown } from 'lucide-react';
+import { Zap, ChevronDown } from 'lucide-react';
 
-export default function Header({ devices, selectedId, setSelectedId, isOnline }) {
-  const activeDevice = devices[selectedId];
-
+export default function Header({ devices = {}, selectedId, setSelectedId, isOnline }) {
   return (
     <header className="bg-white border-b border-slate-200 sticky top-0 z-50">
       <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
