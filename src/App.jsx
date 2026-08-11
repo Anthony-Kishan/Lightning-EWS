@@ -1,171 +1,102 @@
-import { useEffect, useMemo, useState } from 'react';
-import { ref, onValue, query, limitToLast } from 'firebase/database';
-import { db, configError, authReady } from './firebase';
+import React, { useState, useEffect, useMemo } from 'react';
+import { db } from './firebase';
+import { ref, onValue, off, query, limitToLast } from 'firebase/database';
 import Header from './components/Header';
 import StatusPanel from './components/StatusPanel';
-import MapComponent from './components/Map';
-import Charts from './components/Charts';
 import EventFeed from './components/EventFeed';
+import Charts from './components/Charts';
+import MapComponent from './components/Map';
 import HistoryTable from './components/HistoryTable';
-
-// A node is considered offline if it has not checked in for this long.
-const OFFLINE_AFTER_MS = 5 * 60 * 1000;
-const MAX_EVENTS = 200;
-
-// Firebase pushes objects keyed by push-id; the components want a sorted array.
-function toEventArray(raw) {
-  if (!raw) return [];
-  return Object.entries(raw)
-    .map(([id, e]) => ({
-      id,
-      ts: Number(e?.ts) || 0,
-      type: typeof e?.type === 'string' ? e.type : 'unknown',
-      level: Number(e?.level) || 0,
-      distanceKm: Number(e?.distanceKm) || 0,
-    }))
-    .sort((a, b) => b.ts - a.ts); // newest first
-}
+import { ShieldAlert, Volume2, VolumeX } from 'lucide-react';
 
 export default function App() {
   const [devices, setDevices] = useState({});
   const [selectedId, setSelectedId] = useState(null);
-  const [events, setEvents] = useState([]);
-  const [error, setError] = useState(configError);
-  const [loading, setLoading] = useState(!configError);
-  const [now, setNow] = useState(() => Date.now());
+  const [isMuted, setIsMuted] = useState(false);
+  const [loading, setLoading] = useState(true);
 
-  // Subscribe to the device registry (meta + status for every node).
+  // Sound effect for Level 3
+  const alertSound = useMemo(() => new Audio('https://actions.google.com/sounds/v1/alarms/beep_short.ogg'), []);
+
   useEffect(() => {
-    if (!db) return;
-    let cancelled = false;
-
-    authReady.catch((err) => {
-      if (!cancelled) {
-        setError(err.message);
-        setLoading(false);
+    const devicesRef = ref(db, 'devices');
+    onValue(devicesRef, (snapshot) => {
+      const data = snapshot.val() || {};
+      setDevices(data);
+      if (!selectedId && Object.keys(data).length > 0) {
+        setSelectedId(Object.keys(data)[0]);
       }
+      setLoading(false);
     });
-
-    const unsubscribe = onValue(
-      ref(db, 'devices'),
-      (snap) => {
-        if (cancelled) return;
-        setDevices(snap.val() || {});
-        setLoading(false);
-      },
-      (err) => {
-        if (cancelled) return;
-        setError(`Could not read /devices: ${err.message}`);
-        setLoading(false);
-      }
-    );
-
-    return () => {
-      cancelled = true;
-      unsubscribe();
-    };
-  }, []);
-
-  const deviceIds = useMemo(() => Object.keys(devices), [devices]);
-
-  // Keep the selection valid as devices appear or disappear.
-  useEffect(() => {
-    if (deviceIds.length === 0) {
-      if (selectedId !== null) setSelectedId(null);
-    } else if (!selectedId || !deviceIds.includes(selectedId)) {
-      setSelectedId(deviceIds[0]);
-    }
-  }, [deviceIds, selectedId]);
-
-  // Subscribe to the selected device's event log.
-  useEffect(() => {
-    if (!db || !selectedId) {
-      setEvents([]);
-      return;
-    }
-    let cancelled = false;
-
-    const unsubscribe = onValue(
-      query(ref(db, `devices/${selectedId}/events`), limitToLast(MAX_EVENTS)),
-      (snap) => {
-        if (!cancelled) setEvents(toEventArray(snap.val()));
-      },
-      (err) => {
-        if (!cancelled) setError(`Could not read events: ${err.message}`);
-      }
-    );
-
-    return () => {
-      cancelled = true;
-      unsubscribe();
-    };
+    return () => off(devicesRef);
   }, [selectedId]);
 
-  // Drives the relative timestamps in the feed and the online/offline badge.
+  const activeDevice = devices[selectedId] || null;
+  const status = activeDevice?.status || {};
+  const events = activeDevice?.events ? Object.entries(activeDevice.events)
+    .map(([id, val]) => ({ id, ...val }))
+    .sort((a, b) => b.ts - a.ts) : [];
+
+  // Trigger Sound on Level 3
   useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), 30 * 1000);
-    return () => clearInterval(id);
-  }, []);
+    if (status.currentLevel === 3 && !isMuted) {
+      alertSound.play().catch(e => console.log("Audio play blocked by browser"));
+    }
+  }, [status.currentLevel, isMuted, alertSound]);
 
-  const active = (selectedId && devices[selectedId]) || null;
-  const status = active?.status || {};
-  const meta = active?.meta || {};
-  const lastSeen = Number(status.lastSeen) || 0;
-  const isOnline = lastSeen > 0 && now - lastSeen < OFFLINE_AFTER_MS;
-  const lastStrike = events.find((e) => e.distanceKm > 0) || null;
-
-  if (error) {
-    return <Fallback title="Configuration problem" detail={error} />;
-  }
-  if (loading) {
-    return <Fallback title="Connecting to Firebase…" detail="Loading device registry." />;
-  }
-  if (deviceIds.length === 0) {
-    return (
-      <Fallback
-        title="No devices reporting"
-        detail="Nothing has been written to /devices yet. Once a node publishes its meta and status, it will appear here."
-      />
-    );
-  }
-
-  return (
-    <div className="min-h-screen bg-slate-50">
-      <Header
-        devices={devices}
-        selectedId={selectedId}
-        setSelectedId={setSelectedId}
-        isOnline={isOnline}
-      />
-
-      <main className="max-w-7xl mx-auto px-4 py-6 space-y-6">
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <StatusPanel status={status} lastStrike={lastStrike} />
-          <div className="lg:col-span-2">
-            <MapComponent meta={meta} level={status.currentLevel || 0} />
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="lg:col-span-2">
-            <Charts events={events} />
-          </div>
-          <EventFeed events={events} now={now} />
-        </div>
-
-        <HistoryTable events={events} deviceName={meta.name || selectedId} />
-      </main>
+  if (loading) return (
+    <div className="h-screen w-full flex items-center justify-center bg-slate-900 text-white">
+      <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-blue-500"></div>
     </div>
   );
-}
 
-function Fallback({ title, detail }) {
   return (
-    <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
-      <div className="max-w-lg bg-white border border-slate-200 rounded-2xl shadow-sm p-8 text-center">
-        <h1 className="text-lg font-bold mb-2">{title}</h1>
-        <p className="text-sm text-slate-500 leading-relaxed">{detail}</p>
-      </div>
+    <div className="min-h-screen bg-slate-50 pb-12">
+      <Header 
+        devices={devices} 
+        selectedId={selectedId} 
+        setSelectedId={setSelectedId} 
+        isOnline={status.lastSeen > Date.now() - 90000}
+      />
+
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-6">
+        {/* Level 3 Emergency Banner */}
+        {status.currentLevel === 3 && (
+          <div className="mb-6 bg-red-600 rounded-xl p-4 text-white flex items-center justify-between shadow-lg animate-pulse">
+            <div className="flex items-center gap-4">
+              <ShieldAlert size={32} className="shrink-0" />
+              <div>
+                <h2 className="font-bold text-xl uppercase tracking-tight">Immediate Threat: Take Shelter</h2>
+                <p className="text-sm opacity-90">Lightning strike detected within 10km.</p>
+              </div>
+            </div>
+            <button 
+              onClick={() => setIsMuted(!isMuted)}
+              className="p-2 bg-white/20 hover:bg-white/30 rounded-full transition-colors"
+            >
+              {isMuted ? <VolumeX size={24} /> : <Volume2 size={24} />}
+            </button>
+          </div>
+        )}
+
+        {/* Dashboard Grid */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          {/* Left Column: Live Status & Feed */}
+          <div className="lg:col-span-4 space-y-6">
+            <StatusPanel status={status} lastStrike={events[0]} />
+            <EventFeed events={events.slice(0, 50)} />
+          </div>
+
+          {/* Right Column: Analytics & Map */}
+          <div className="lg:col-span-8 space-y-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <Charts events={events} />
+              <MapComponent meta={activeDevice?.meta} level={status.currentLevel} />
+            </div>
+            <HistoryTable events={events} deviceName={activeDevice?.meta?.name} />
+          </div>
+        </div>
+      </main>
     </div>
   );
 }
