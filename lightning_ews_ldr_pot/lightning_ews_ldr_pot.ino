@@ -1,52 +1,64 @@
 /*
  * ============================================================================
  *  Lightning Early-Warning System
- *  CAPTIVE-PORTAL WiFi  +  FIREBASE LOGGING  +  BENGALI (UCS2) SMS
- *  Final-Year CSE Project  |  Author: Ahoshan
+ *  LDR FLASH DETECTION + B5K POT DISTANCE  |  CAPTIVE-PORTAL WiFi
+ *  FIREBASE LOGGING  |  BENGALI (UCS2) SMS
+ *  Final-Year CSE Project  |  Author: Imran
  * ----------------------------------------------------------------------------
- *  IMPORTANT: SAVE THIS FILE AS UTF-8.
- *  Arduino IDE 2.x does this by default. If the Bengali text below looks like
- *  garbage in your editor, the file encoding is wrong and the SMS will be
- *  wrong too.
+ *  IMPORTANT: SAVE THIS FILE AS UTF-8, or the Bengali SMS will be garbled.
  * ----------------------------------------------------------------------------
- *  WiFi PROVISIONING (no hardcoded credentials)
- *    - Boot reads saved WiFi from ESP32 flash (NVS).
- *    - If none / unreachable -> opens AP "Lightning-EWS-Setup" (pw lightning123)
- *    - Connect a phone, captive portal opens (or go to http://192.168.4.1)
- *    - Pick network, enter password, Save -> node reboots, connects, AP closes.
- *    - Hold the silence button (GPIO23) 3 s to wipe WiFi and re-open setup.
+ *  TWO SENSOR SOURCES (pick one line below)
  *
- *  BENGALI SMS
- *    The SIM800L cannot send Bengali in the GSM 7-bit alphabet. Messages are
- *    converted UTF-8 -> UTF-16BE and sent as hex with the module in UCS2 mode
- *    (AT+CSCS="UCS2", AT+CSMP dcs=8). The phone number is hex-encoded too,
- *    which is the step most guides miss.
- *    NOTE: a UCS2 SMS holds only 70 characters, not 160.
+ *    SRC_EMULATOR   Button (GPIO4) fires a strike. B5K pot (GPIO34) sets the
+ *                   distance 1-40 km. You can also type a number in Serial.
+ *                   Use this to demo the whole system with no light needed.
+ *
+ *    SRC_LDR_FLASH  LDR (GPIO35) detects a bright flash. The B5K pot (GPIO34)
+ *                   sets the reported distance. So the LDR answers "did
+ *                   lightning happen?" and the pot answers "how far?".
+ *                   Test it with a camera flash or a torch.
+ *
+ *  Both sources share the SAME pipeline: threat grading, siren, strobe,
+ *  Bengali SMS, Firebase logging, 30-min all-clear.
+ * ----------------------------------------------------------------------------
+ *  ADC NOTE: GPIO34 (pot) and GPIO35 (LDR) are both ADC1. This matters -
+ *  ADC2 pins stop reading once WiFi is on, so do not move these to ADC2.
+ *
+ *  LDR WIRING (voltage divider):
+ *      3V3 ---- LDR ----+---- GPIO35
+ *      
+ *                       |
+ *                      10k
+ *                       |
+ *                      GND
+ *      More light -> higher voltage on GPIO35. If yours reads backwards,
+ *      swap the LDR and the 10k resistor.
+ *
+ *  B5K POT WIRING:
+ *      one outer leg -> 3V3, other outer leg -> GND, wiper -> GPIO34
  *
  *  LIBRARIES: only Mobizt's "Firebase Arduino Client Library for ESP8266 and
  *  ESP32" is external. WebServer / DNSServer / Preferences ship with the core.
  * ============================================================================
  */
 
-#include <Wire.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <time.h>
-#include <Firebase_ESP_Client.h>
-#include "addons/TokenHelper.h"
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 
 // ------------------- CHOOSE YOUR SOURCE (change this one line) -------------
-#define SRC_EMULATOR       2
-#define SRC_FLASH_THUNDER  3
-#define SRC_AS3935         1
+#define SRC_EMULATOR    1
+#define SRC_LDR_FLASH   2
 
-#define SENSOR_SOURCE   SRC_EMULATOR
+#define SENSOR_SOURCE   SRC_LDR_FLASH
 // --------------------------------------------------------------------------
 
 // ------------------------------ USER CONFIG --------------------------------
-const char* RECIPIENTS[] = { "+8801540392159", "+8801581413109" };
+const char* RECIPIENTS[] = { "+8801798173527", "+8801581413109" };//8801540392159
 const uint8_t NUM_RECIPIENTS = sizeof(RECIPIENTS) / sizeof(RECIPIENTS[0]);
 
 // Node name appears in every SMS. Keep it SHORT - UCS2 SMS = 70 chars total.
@@ -58,9 +70,17 @@ const uint8_t KM_WARNING = 25;              // <= 25 km -> WARNING      (L2)
                                             //  > 25 km -> WATCH        (L1)
 const unsigned long ALL_CLEAR_MS = 30UL * 60UL * 1000UL;   // 30 min
 
+// ------------------------- LDR FLASH TUNING --------------------------------
+// A flash is detected when the LDR reading jumps this far above its slow
+// rolling baseline. Raise it if daylight/room lights cause false triggers;
+// lower it if a real flash is missed. Watch the Serial plot to tune.
+const int  FLASH_DELTA       = 400;       // ADC counts above baseline (0-4095)
+const unsigned long FLASH_COOLDOWN_MS = 2000;  // ignore re-triggers for 2 s
+const float BASELINE_ALPHA   = 0.005f;    // baseline drift speed (smaller=slower)
+
 // ---------------------------- [PORTAL] CONFIG ------------------------------
 #define AP_SSID         "Lightning-EWS-Setup"
-#define AP_PASSWORD     "11112222"      // >= 8 chars
+#define AP_PASSWORD     "11112222"          // >= 8 chars
 #define WIFI_CONNECT_TIMEOUT_MS 20000
 #define NVS_NAMESPACE   "ewscfg"
 
@@ -72,7 +92,7 @@ const unsigned long ALL_CLEAR_MS = 30UL * 60UL * 1000UL;   // 30 min
 #define DEVICE_LOCATION "Field site, Dhaka"
 #define DEVICE_LAT      23.8103
 #define DEVICE_LNG      90.4125
-#define FIRMWARE_VER    "1.3-bn"
+#define FIRMWARE_VER    "1.4-ldr"
 
 const bool CLOUD_ENABLED = true;
 const unsigned long HEARTBEAT_MS = 30000;
@@ -80,25 +100,16 @@ const long  GMT_OFFSET_SEC = 0;             // store UTC; dashboard converts
 const int   DST_OFFSET_SEC = 0;
 
 // ------------------------------ PIN MAP ------------------------------------
-#define PIN_SIM_RX     16
-#define PIN_SIM_TX     17
+#define PIN_SIM_RX     16    // ESP32 RX2 <- SIM800L TXD
+#define PIN_SIM_TX     17    // ESP32 TX2 -> SIM800L RXD (via divider)
 #define PIN_SIREN      21
 #define PIN_STROBE     26
 #define PIN_STATUS_LED  2
 #define PIN_SILENCE    23    // short press = mute siren; hold 3 s = forget WiFi
 
-#define PIN_STRIKE_BTN  4
-#define PIN_POT         34
-#define PIN_LIGHT       35
-#define PIN_SOUND       32
-
-#define PIN_AS3935_IRQ  4
-#define PIN_SDA        21
-#define PIN_SCL        22
-
-#if (SENSOR_SOURCE == SRC_AS3935) && (PIN_SIREN == PIN_SDA)
-#error "PIN_SIREN (21) collides with PIN_SDA for the AS3935. Set PIN_SIREN to 25."
-#endif
+#define PIN_STRIKE_BTN  4    // emulator strike button (to GND)
+#define PIN_POT         34   // B5K pot wiper -> distance 1-40 km   (ADC1)
+#define PIN_LDR         35   // LDR divider    -> flash detection    (ADC1)
 
 HardwareSerial sim800(2);
 
@@ -118,10 +129,12 @@ bool     portalActive   = false;
 String   savedSSID      = "";
 String   savedPASS      = "";
 unsigned long silenceHeldSince = 0;
+String   scanCache      = "";      // pre-rendered <option> list
+int      scanCount      = -1;      // -1 = never scanned
 
-FirebaseData   fbdo;
-FirebaseAuth   fbauth;
-FirebaseConfig fbconfig;
+
+
+#define FB_DB_SECRET "B96EGBeRsrcaxMdkIVEFWEjv1eHILBGPpbTNWPeW"
 bool     firebaseReady   = false;
 bool     timeSynced      = false;
 unsigned long lastBeatMs = 0;
@@ -172,6 +185,14 @@ String utf8ToUcs2Hex(const String &utf8) {
 uint16_t ucs2Units(const String &hex) { return hex.length() / 4; }
 
 // ===========================================================================
+//  SHARED INPUT HELPER — the B5K pot sets distance in BOTH modes
+// ===========================================================================
+uint8_t readPotKm() {
+  int raw = analogRead(PIN_POT);                    // 0..4095
+  return (uint8_t)constrain(map(raw, 0, 4095, 1, 40), 1, 40);
+}
+
+// ===========================================================================
 //  [PORTAL] Credential storage in NVS flash
 // ===========================================================================
 void credsLoad() {
@@ -199,6 +220,38 @@ void credsClear() {
   Serial.println(F("[NVS] Credentials cleared."));
 }
 
+
+// ---------------------------------------------------------------------------
+//  Scan into a cache. Doing this OUTSIDE the page render is the fix: scanning
+//  during an HTTP response makes the AP stall and the browser time out.
+//  async=false, show_hidden=true, and an explicit STA disconnect first give
+//  the most reliable result while softAP is running.
+// ---------------------------------------------------------------------------
+void scanNetworksCached() {
+  Serial.println(F("[SCAN] Scanning..."));
+  WiFi.scanDelete();
+  WiFi.disconnect(false, false);      // drop any half-open STA attempt
+  delay(100);
+
+  scanCount = WiFi.scanNetworks(false, true);   // blocking, include hidden
+  scanCache = "";
+
+  if (scanCount <= 0) {
+    Serial.println(F("[SCAN] No networks found."));
+  } else {
+    Serial.print(F("[SCAN] Found ")); Serial.println(scanCount);
+    for (int i = 0; i < scanCount && i < 25; i++) {
+      String ssid = WiFi.SSID(i);
+      if (ssid.length() == 0) continue;                 // skip hidden/blank
+      scanCache += "<option value='" + ssid + "'>" + ssid +
+                   "  (" + String(WiFi.RSSI(i)) + " dBm)</option>";
+    }
+  }
+  WiFi.scanDelete();
+}
+
+
+
 // ===========================================================================
 //  [PORTAL] Setup page served from the AP at 192.168.4.1
 // ===========================================================================
@@ -218,43 +271,78 @@ String portalHtml(const String &msg = "") {
          "select,input{width:100%;padding:11px;border:1px solid #c7d6d6;border-radius:8px;font-size:15px}"
          "button{width:100%;margin-top:18px;padding:13px;border:0;border-radius:8px;"
          "background:#0f3d3e;color:#fff;font-size:16px;font-weight:600}"
-         "button.alt{background:#fff;color:#c62828;border:1px solid #c62828;margin-top:9px}"
+         "button.alt{background:#fff;color:#0f3d3e;border:1px solid #0f3d3e;margin-top:9px}"
+         "button.danger{background:#fff;color:#c62828;border:1px solid #c62828;margin-top:9px}"
          ".msg{padding:10px;border-radius:8px;background:#eaf5ee;color:#1f6b40;"
          "font-size:13.5px;margin-bottom:14px}"
+         ".warn{background:#fff4e5;color:#8a5300}"
+         ".or{text-align:center;font-size:12px;color:#8a9a9a;margin:12px 0 0}"
+         ".hint{font-size:11.5px;color:#8a9a9a;margin:5px 0 0}"
          "</style></head><body><div class='card'>"
          "<h1>Lightning EWS</h1><p class='sub'>Connect this node to WiFi</p>");
+
   if (msg.length()) h += "<div class='msg'>" + msg + "</div>";
 
+  if (scanCount == 0)
+    h += F("<div class='msg warn'>No networks detected. Type the network name "
+           "manually below, or tap Rescan.</div>");
+
   h += F("<form method='POST' action='/save'>"
-         "<label>Network</label><select name='ssid'>");
-  int n = WiFi.scanNetworks();
-  if (n <= 0) h += F("<option value=''>No networks found - reload to rescan</option>");
-  else {
-    for (int i = 0; i < n && i < 20; i++) {
-      h += "<option value='" + WiFi.SSID(i) + "'>" + WiFi.SSID(i) +
-           "  (" + String(WiFi.RSSI(i)) + " dBm)</option>";
-    }
-  }
-  WiFi.scanDelete();
+         "<label>Nearby networks</label><select name='ssid' id='pick'>"
+         "<option value=''>-- select a network --</option>");
+  h += scanCache;                       // cached, no scan during render
   h += F("</select>"
+
+         "<p class='or'>or</p>"
+
+         "<label>Enter network name manually</label>"
+         "<input type='text' name='ssid_manual' id='man' "
+         "placeholder='Type exact SSID (case sensitive)' autocapitalize='off' "
+         "autocorrect='off' spellcheck='false'>"
+         "<p class='hint'>Use this for hidden networks or if the scan is empty. "
+         "This overrides the dropdown.</p>"
+
          "<label>Password</label>"
-         "<input type='password' name='pass' placeholder='WiFi password'>"
+         "<input type='password' name='pass' placeholder='WiFi password' "
+         "autocapitalize='off' autocorrect='off' spellcheck='false'>"
+         "<p class='hint'>Leave empty for an open network.</p>"
+
          "<button type='submit'>Save &amp; Connect</button></form>"
+
+         "<form method='POST' action='/rescan'>"
+         "<button class='alt' type='submit'>Rescan networks</button></form>"
+
          "<form method='POST' action='/forget'>"
-         "<button class='alt' type='submit'>Forget saved WiFi</button></form>"
+         "<button class='danger' type='submit'>Forget saved WiFi</button></form>"
+
+         "<script>"
+         "var m=document.getElementById('man'),p=document.getElementById('pick');"
+         "m.addEventListener('input',function(){if(m.value)p.selectedIndex=0;});"
+         "p.addEventListener('change',function(){if(p.value)m.value='';});"
+         "</script>"
          "</div></body></html>");
   return h;
 }
 
+
 void handleRoot() { portal.send(200, "text/html", portalHtml()); }
 
 void handleSave() {
-  String ssid = portal.arg("ssid");
-  String pass = portal.arg("pass");
+  String ssid   = portal.arg("ssid");
+  String manual = portal.arg("ssid_manual");
+  String pass   = portal.arg("pass");
+
+  manual.trim();                        // stray spaces are a classic failure
+  if (manual.length() > 0) ssid = manual;   // manual entry overrides the list
+  ssid.trim();
+
   if (ssid.length() == 0) {
-    portal.send(200, "text/html", portalHtml("Please choose a network."));
+    portal.send(200, "text/html",
+      portalHtml("Please pick a network or type its name."));
     return;
   }
+
+  Serial.print(F("[PORTAL] Saving SSID: ")); Serial.println(ssid);
   credsSave(ssid, pass);
   portal.send(200, "text/html",
     F("<!DOCTYPE html><html><head><meta charset='utf-8'>"
@@ -263,9 +351,16 @@ void handleSave() {
       "text-align:center;padding:60px 22px}h2{margin:0 0 10px}p{color:#bcd}"
       "</style></head><body><h2>Saved</h2>"
       "<p>The node is restarting and will connect to your network.<br>"
-      "This setup network will disappear.</p></body></html>"));
+      "This setup network will disappear.<br><br>"
+      "If it cannot connect, the setup network reappears.</p></body></html>"));
   delay(1200);
   ESP.restart();
+}
+
+void handleRescan() {
+  scanNetworksCached();
+  portal.send(200, "text/html",
+    portalHtml(scanCount > 0 ? "Scan complete." : "Still nothing found."));
 }
 
 void handleForget() {
@@ -286,12 +381,15 @@ void startPortal() {
   IPAddress ip = WiFi.softAPIP();
   dns.start(53, "*", ip);
 
+    scanNetworksCached();
+
   portal.on("/", handleRoot);
   portal.on("/save",   HTTP_POST, handleSave);
+  portal.on("/rescan", HTTP_POST, handleRescan); 
   portal.on("/forget", HTTP_POST, handleForget);
-  portal.on("/generate_204",       handleNotFound);
-  portal.on("/fwlink",             handleNotFound);
-  portal.on("/hotspot-detect.html",handleNotFound);
+  portal.on("/generate_204",        handleNotFound);
+  portal.on("/fwlink",              handleNotFound);
+  portal.on("/hotspot-detect.html", handleNotFound);
   portal.onNotFound(handleNotFound);
   portal.begin();
 
@@ -355,7 +453,7 @@ void checkForgetButton() {
 }
 
 // ===========================================================================
-//  SENSOR SOURCE 1 — EMULATOR
+//  SENSOR SOURCE 1 — EMULATOR (button fires, pot sets distance)
 // ===========================================================================
 #if SENSOR_SOURCE == SRC_EMULATOR
 bool lastBtn = HIGH;
@@ -364,22 +462,20 @@ unsigned long lastBtnMs = 0;
 void sensorSetup() {
   pinMode(PIN_STRIKE_BTN, INPUT_PULLUP);
   analogReadResolution(12);
-  Serial.println(F("[SRC] EMULATOR: button = strike, pot = distance (1-40 km)."));
-}
-
-uint8_t readPotKm() {
-  return constrain(map(analogRead(PIN_POT), 0, 4095, 1, 40), 1, 40);
+  Serial.println(F("[SRC] EMULATOR: button = strike, B5K pot = distance (1-40 km)."));
+  Serial.println(F("      You can also type a distance in Serial and press Enter."));
 }
 
 bool sensorPoll(uint8_t &distanceKm) {
   bool b = digitalRead(PIN_STRIKE_BTN);
-  if (lastBtn == HIGH && b == LOW && millis() - lastBtnMs > 250) {
+  if (lastBtn == HIGH && b == LOW && millis() - lastBtnMs > 250) {   // debounce
     lastBtnMs = millis(); lastBtn = b;
     distanceKm = readPotKm();
     Serial.print(F("[SRC] Button strike @ ")); Serial.print(distanceKm); Serial.println(F(" km"));
     return true;
   }
   lastBtn = b;
+
   if (Serial.available()) {
     int km = Serial.parseInt();
     if (km >= 1 && km <= 40) {
@@ -393,94 +489,112 @@ bool sensorPoll(uint8_t &distanceKm) {
 #endif
 
 // ===========================================================================
-//  SENSOR SOURCE 2 — FLASH + THUNDER
+//  SENSOR SOURCE 2 — LDR FLASH (LDR detects, pot sets distance)
+//  The LDR answers "did lightning flash?"  The pot answers "how far?"
 // ===========================================================================
-#if SENSOR_SOURCE == SRC_FLASH_THUNDER
-float lightBase = 0, soundBase = 0;
-bool  waitingThunder = false;
-unsigned long tFlash = 0;
-const int FLASH_DELTA = 350, SOUND_DELTA = 300;
-const unsigned long THUNDER_TIMEOUT = 45000;
-const uint8_t FLASH_ONLY_KM = 15;
+#if SENSOR_SOURCE == SRC_LDR_FLASH
+float         ldrBase      = 0;      // slow rolling baseline of ambient light
+unsigned long lastFlashMs  = 0;      // cooldown so one flash = one event
+bool          baseReady    = false;
 
 void sensorSetup() {
   analogReadResolution(12);
-  lightBase = analogRead(PIN_LIGHT);
-  soundBase = analogRead(PIN_SOUND);
-  Serial.println(F("[SRC] FLASH+THUNDER ready."));
+  // Seed the baseline with an average so the first reading isn't noise
+  long sum = 0;
+  for (int i = 0; i < 32; i++) { sum += analogRead(PIN_LDR); delay(10); }
+  ldrBase = sum / 32.0f;
+  baseReady = true;
+
+  Serial.println(F("[SRC] LDR FLASH mode."));
+  Serial.print (F("      Ambient baseline: ")); Serial.println((int)ldrBase);
+  Serial.print (F("      Trigger delta   : ")); Serial.println(FLASH_DELTA);
+  Serial.println(F("      B5K pot sets the reported distance (1-40 km)."));
+  Serial.println(F("      Test with a camera flash or a torch."));
 }
 
 bool sensorPoll(uint8_t &distanceKm) {
-  int light = analogRead(PIN_LIGHT), sound = analogRead(PIN_SOUND);
-  lightBase = lightBase * 0.995f + light * 0.005f;
-  soundBase = soundBase * 0.990f + sound * 0.010f;
-  if (!waitingThunder) {
-    if (light - lightBase > FLASH_DELTA) {
-      waitingThunder = true; tFlash = millis();
-      Serial.println(F("[SRC] Flash detected, timing thunder..."));
-    }
-    return false;
-  }
-  unsigned long gap = millis() - tFlash;
-  if (sound - soundBase > SOUND_DELTA) {
-    waitingThunder = false;
-    distanceKm = (uint8_t)constrain((int)(gap * 0.000343f + 0.5f), 1, 40);
-    Serial.print(F("[SRC] Thunder -> ")); Serial.print(distanceKm); Serial.println(F(" km"));
-    return true;
-  }
-  if (gap > THUNDER_TIMEOUT) {
-    waitingThunder = false; distanceKm = FLASH_ONLY_KM;
-    Serial.println(F("[SRC] Flash, no thunder -> distant storm."));
+  int light = analogRead(PIN_LDR);
+
+  // Slow-moving baseline: tracks sunrise/sunset and room lighting, but is far
+  // too slow to follow a lightning flash, so a flash stands out as a spike.
+  ldrBase = ldrBase * (1.0f - BASELINE_ALPHA) + light * BASELINE_ALPHA;
+
+  // Cooldown: a real flash lingers for many loop passes, and lightning often
+  // flickers. Without this one strike would fire dozens of events.
+  if (millis() - lastFlashMs < FLASH_COOLDOWN_MS) return false;
+
+  if (light - ldrBase > FLASH_DELTA) {
+    lastFlashMs = millis();
+    distanceKm  = readPotKm();                  // pot decides the distance
+    Serial.print(F("[SRC] FLASH detected (raw ")); Serial.print(light);
+    Serial.print(F(", base ")); Serial.print((int)ldrBase);
+    Serial.print(F(") @ ")); Serial.print(distanceKm); Serial.println(F(" km"));
     return true;
   }
   return false;
 }
+
+// Prints raw LDR values so you can tune FLASH_DELTA on the Serial Plotter.
+// Call this from loop() only while calibrating, then comment it out.
 #endif
 
 // ===========================================================================
-//  SENSOR SOURCE 3 — AS3935
+//  LIVE SENSOR MONITOR — non-blocking, prints POT + LDR continuously
+//  Set MONITOR_MS to 0 to disable. Uses millis(), never delay(), so alarms,
+//  WiFi, and Firebase keep running normally while it prints.
 // ===========================================================================
-#if SENSOR_SOURCE == SRC_AS3935
-#include "SparkFun_AS3935.h"
-#define AS3935_OUTDOOR 0x0E
-#define INT_LIGHTNING 0x08
-SparkFun_AS3935 lightning(0x03);
-volatile bool irqFlag = false; volatile uint32_t irqAtMs = 0;
-void IRAM_ATTR onIRQ(){ irqFlag = true; irqAtMs = millis(); }
+const unsigned long MONITOR_MS = 250;   // print interval; 0 = off
 
-void sensorSetup() {
-  Wire.begin(PIN_SDA, PIN_SCL);
-  if (!lightning.begin(Wire)) Serial.println(F("[AS3935] not found!"));
-  lightning.setIndoorOutdoor(AS3935_OUTDOOR);
-  lightning.setNoiseLevel(2);
-  lightning.watchdogThreshold(2);
-  lightning.spikeRejection(2);
-  lightning.lightningThreshold(1);
-  pinMode(PIN_AS3935_IRQ, INPUT);
-  attachInterrupt(digitalPinToInterrupt(PIN_AS3935_IRQ), onIRQ, RISING);
-  Serial.println(F("[SRC] AS3935 ready."));
-}
+void sensorMonitor() {
+  if (MONITOR_MS == 0) return;
+  static unsigned long tLast = 0;
+  if (millis() - tLast < MONITOR_MS) return;
+  tLast = millis();
 
-bool sensorPoll(uint8_t &distanceKm) {
-  if (!irqFlag || (millis() - irqAtMs) <= 2) return false;
-  irqFlag = false;
-  if (lightning.readInterruptReg() != INT_LIGHTNING) return false;
-  uint8_t d = lightning.distanceToStorm();
-  if (d == 63 || d == 0) return false;
-  distanceKm = d;
-  return true;
-}
+  int potRaw = analogRead(PIN_POT);
+  int ldrRaw = analogRead(PIN_LDR);
+  uint8_t km = (uint8_t)constrain(map(potRaw, 0, 4095, 1, 40), 1, 40);
+
+  // Serial Plotter friendly: "LABEL:value" pairs separated by spaces/tabs
+  Serial.print(F("POT:"));    Serial.print(potRaw);
+  Serial.print(F("\tKM:"));   Serial.print(km);
+  Serial.print(F("\tLDR:"));  Serial.print(ldrRaw);
+
+#if SENSOR_SOURCE == SRC_LDR_FLASH
+  Serial.print(F("\tBASE:"));  Serial.print((int)ldrBase);
+  Serial.print(F("\tDELTA:")); Serial.print(ldrRaw - (int)ldrBase);
+  Serial.print(F("\tTRIG:"));  Serial.print(FLASH_DELTA);
+  // headroom: how close you are to firing (negative = would trigger)
+  Serial.print(F("\tGAP:"));   Serial.print(FLASH_DELTA - (ldrRaw - (int)ldrBase));
 #endif
+
+  Serial.println();
+}
 
 // ===========================================================================
 //  [CLOUD] time + Firebase
 // ===========================================================================
-void timeSync() {
-  if (!CLOUD_ENABLED || WiFi.status() != WL_CONNECTED) return;
-  configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, "pool.ntp.org", "time.nist.gov");
-  struct tm ti;
-  if (getLocalTime(&ti, 8000)) { timeSynced = true; Serial.println(F("[NTP] Synced (UTC).")); }
-  else Serial.println(F("[NTP] Sync failed; will retry."));
+bool sntpStarted = false;      // add near your other cloud state
+
+// Start SNTP ONCE. Calling configTime() repeatedly is what triggers the
+// "Required to lock TCPIP core functionality!" assert and reboot loop.
+void timeSyncBegin() {
+  if (!CLOUD_ENABLED || sntpStarted) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC,
+             "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+  sntpStarted = true;
+  Serial.println(F("[NTP] SNTP started, waiting for time..."));
+}
+
+// Non-blocking check. Safe to call as often as you like.
+void timeSyncPoll() {
+  if (timeSynced || !sntpStarted) return;
+  time_t now = time(nullptr);
+  if (now > 1700000000) {                 // sane epoch => we have real time
+    timeSynced = true;
+    Serial.print(F("[NTP] Synced (UTC): ")); Serial.println((uint32_t)now);
+  }
 }
 
 uint64_t epochMs() {
@@ -489,70 +603,81 @@ uint64_t epochMs() {
   return (uint64_t)now * 1000ULL;
 }
 
-void firebaseInit() {
-  if (!CLOUD_ENABLED || WiFi.status() != WL_CONNECTED) return;
-  fbconfig.api_key      = FB_API_KEY;
-  fbconfig.database_url = FB_DATABASE_URL;
-  fbconfig.token_status_callback = tokenStatusCallback;
 
-  if (Firebase.signUp(&fbconfig, &fbauth, "", ""))
-    Serial.println(F("[FB] Anonymous auth OK."));
-  else {
-    Serial.print(F("[FB] Auth error: "));
-    Serial.println(fbconfig.signer.signupError.message.c_str());
+// ===========================================================================
+//  FIREBASE via plain REST  (stateless - no persistent TLS to time out)
+//  Each call opens a connection, sends, closes. Slower per call, but it
+//  cannot be broken by the blocking SMS delays, and uses far less RAM.
+// ===========================================================================
+
+// method: "PUT" to overwrite a path, "POST" to push a new child
+bool fbSend(const String &path, const String &json, const char* method) {
+  if (!CLOUD_ENABLED || WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("[FB] Offline, skipped."));
+    return false;
   }
-  Firebase.begin(&fbconfig, &fbauth);
-  Firebase.reconnectWiFi(true);
-  fbdo.setBSSLBufferSize(2048, 1024);
-  firebaseReady = true;
 
-  FirebaseJson meta;
-  meta.set("name",     NODE_NAME);
-  meta.set("location", DEVICE_LOCATION);
-  meta.set("lat",      DEVICE_LAT);
-  meta.set("lng",      DEVICE_LNG);
-  meta.set("firmware", FIRMWARE_VER);
-  String path = String("/devices/") + DEVICE_ID + "/meta";
-  if (Firebase.RTDB.setJSON(&fbdo, path.c_str(), &meta))
-    Serial.println(F("[FB] Meta published."));
-  else Serial.println("[FB] Meta failed: " + fbdo.errorReason());
+  WiFiClientSecure client;
+  client.setInsecure();               // skip cert validation (fine for this project)
+  client.setTimeout(8000);
+
+  String url = String(FB_DATABASE_URL);
+  if (url.endsWith("/")) url.remove(url.length() - 1);
+  url += path + ".json?auth=" + FB_DB_SECRET;
+
+  HTTPClient http;
+  http.setTimeout(8000);
+  http.setReuse(false);
+  if (!http.begin(client, url)) {
+    Serial.println(F("[FB] begin() failed"));
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+
+  int code = http.sendRequest(method, (uint8_t*)json.c_str(), json.length());
+  bool ok = (code == 200);
+  if (!ok) { Serial.print(F("[FB] HTTP ")); Serial.println(code); }
+  http.end();                          // close immediately, keep nothing open
+  return ok;
 }
 
-void logEvent(uint8_t level, uint8_t distanceKm, const char* type) {
-  if (!CLOUD_ENABLED || !firebaseReady || WiFi.status() != WL_CONNECTED) {
-    Serial.println(F("[FB] Offline, event not logged."));
-    return;
-  }
-  FirebaseJson ev;
-  ev.set("ts",         (double)epochMs());
-  ev.set("type",       type);
-  ev.set("level",      (int)level);
-  ev.set("distanceKm", (int)distanceKm);
-  String path = String("/devices/") + DEVICE_ID + "/events";
-  if (Firebase.RTDB.pushJSON(&fbdo, path.c_str(), &ev)) {
-    Serial.print(F("[FB] Event logged: ")); Serial.println(type);
-  } else Serial.println("[FB] Event failed: " + fbdo.errorReason());
-  pushStatus();
+void firebaseInit() {
+  if (!CLOUD_ENABLED || WiFi.status() != WL_CONNECTED) return;
+  String meta = "{\"name\":\"" + String(NODE_NAME) +
+                "\",\"location\":\"" + String(DEVICE_LOCATION) +
+                "\",\"lat\":" + String(DEVICE_LAT, 4) +
+                ",\"lng\":" + String(DEVICE_LNG, 4) +
+                ",\"firmware\":\"" + String(FIRMWARE_VER) + "\"}";
+  if (fbSend("/devices/" DEVICE_ID "/meta", meta, "PUT"))
+    Serial.println(F("[FB] Meta published."));
+  firebaseReady = true;
 }
 
 void pushStatus() {
-  if (!CLOUD_ENABLED || !firebaseReady || WiFi.status() != WL_CONNECTED) return;
-  FirebaseJson st;
-  st.set("online",       true);
-  st.set("lastSeen",     (double)epochMs());
-  st.set("rssi",         (int)WiFi.RSSI());
-  st.set("currentLevel", (int)currentLevel);
-  st.set("stormActive",  stormActive);
-  String path = String("/devices/") + DEVICE_ID + "/status";
-  if (!Firebase.RTDB.setJSON(&fbdo, path.c_str(), &st))
-    Serial.println("[FB] Status failed: " + fbdo.errorReason());
+  String st = "{\"online\":true,\"lastSeen\":" + String((double)epochMs(), 0) +
+              ",\"rssi\":" + String(WiFi.RSSI()) +
+              ",\"currentLevel\":" + String(currentLevel) +
+              ",\"stormActive\":" + String(stormActive ? "true" : "false") + "}";
+  if (fbSend("/devices/" DEVICE_ID "/status", st, "PUT"))
+    Serial.println(F("[FB] Status OK."));
+}
+
+void logEvent(uint8_t level, uint8_t distanceKm, const char* type) {
+  String ev = "{\"ts\":" + String((double)epochMs(), 0) +
+              ",\"type\":\"" + String(type) +
+              "\",\"level\":" + String(level) +
+              ",\"distanceKm\":" + String(distanceKm) + "}";
+  if (fbSend("/devices/" DEVICE_ID "/events", ev, "POST"))
+    { Serial.print(F("[FB] Event logged: ")); Serial.println(type); }
+  // NOTE: no pushStatus() here - it happens in handleEvent, before the SMS
 }
 
 void heartbeatTick() {
   if (portalActive) return;
   if (millis() - lastBeatMs < HEARTBEAT_MS) return;
   lastBeatMs = millis();
-  if (!timeSynced) timeSync();
+  timeSyncBegin();     // no-op after the first call
+  timeSyncPoll();
   if (!firebaseReady && WiFi.status() == WL_CONNECTED) firebaseInit();
   pushStatus();
 }
@@ -598,22 +723,20 @@ void handleEvent(uint8_t distanceKm) {
   if (distanceKm < nearestKm) nearestKm = distanceKm;
 
   uint8_t level = gradeThreat(distanceKm);
+  if (level > currentLevel) { currentLevel = level; silenced = false; }
 
-  // Log every strike so the dashboard charts show the whole storm.
+  // --- Cloud first: fast, and finished before SMS blocks the CPU ---
   logEvent(level, distanceKm, "strike");
+  pushStatus();
 
-  if (level > currentLevel) {                 // escalation only
-    currentLevel = level;
-    silenced = false;                         // closer strike re-arms the siren
+  // --- Then the slow blocking SMS ---
+  if (level == currentLevel && !smsSent[level]) {
     Serial.print(F("[ALERT] -> ")); Serial.println(levelLabelEn(level));
-
-    if (!smsSent[level]) {
-      String m = String(NODE_NAME) + ": " + levelLabel(level) +
-                 "। বজ্রপাত প্রায় " + String(distanceKm) + " কিমি দূরে। " +
-                 levelAdvice(level);
-      broadcastSMS(m);
-      smsSent[level] = true;
-    }
+    String m = String(NODE_NAME) + ": " + levelLabel(level) +
+               "। বজ্রপাত ~" + String(distanceKm) + " কিমি দূরে। " +
+               levelAdvice(level);
+    broadcastSMS(m);
+    smsSent[level] = true;
   }
 }
 
@@ -686,7 +809,7 @@ void broadcastSMS(const String &text) {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println(F("\n[EWS] Booting (portal + cloud + Bengali SMS)..."));
+  Serial.println(F("\n[EWS] Booting (LDR + pot / portal / cloud / Bengali SMS)..."));
 
   pinMode(PIN_SIREN, OUTPUT);  pinMode(PIN_STROBE, OUTPUT);
   pinMode(PIN_STATUS_LED, OUTPUT); pinMode(PIN_SILENCE, INPUT_PULLUP);
@@ -696,7 +819,10 @@ void setup() {
 
   credsLoad();
   if (wifiTryConnect()) {
-    timeSync();
+    timeSyncBegin();
+    // give NTP a few seconds, but never block forever
+    for (int i = 0; i < 40 && !timeSynced; i++) { delay(250); timeSyncPoll(); }
+    if (!timeSynced) Serial.println(F("[NTP] Not synced yet; continuing."));
     firebaseInit();
     pushStatus();
   } else {
@@ -716,6 +842,7 @@ void loop() {
     dns.processNextRequest();
     portal.handleClient();
     portalBlink();
+    sensorMonitor();
 
     uint8_t d;
     if (sensorPoll(d)) handleEvent(d);     // alarms work during setup too
@@ -724,8 +851,16 @@ void loop() {
   }
 
   // ---- Normal operation ----
+
   uint8_t distanceKm;
   if (sensorPoll(distanceKm)) handleEvent(distanceKm);
+
+  sensorMonitor();          // live POT + LDR readout
+
+  // Uncomment while tuning FLASH_DELTA, then comment out again:
+  // #if SENSOR_SOURCE == SRC_LDR_FLASH
+  //   ldrDebugPrint();
+  // #endif
 
   if (digitalRead(PIN_SILENCE) == LOW) silenced = true;
   checkForgetButton();                     // hold 3 s = wipe WiFi + restart
